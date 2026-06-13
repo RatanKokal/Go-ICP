@@ -1,7 +1,7 @@
 // =============================================================================
 // goicp_gpu.cu  —  Method A CUDA implementation (rev 2)
 //
-// Rev 2 structural changes (all correctness-preserving):
+// Rev 2 structural changes (rev 2.1 adds fix 5 — critical overflow fix):
 //
 //  1. MERGED UB+LB PASS
 //     eval_trans_children now computes both local_ub (rotation UB) and
@@ -20,7 +20,17 @@
 //     dropped in rev 1 (correctness risk).  Rev 2 sets d_overflow_flag and
 //     GpuRunBatch aborts with a fatal message so the problem is visible.
 //
-//  4. GPU_MAX_TRANS raised to 4096 (was 1024)
+//  4. GPU_MAX_TRANS raised to 4096 (was 1024; safety margin after fix 5)
+//
+//  5. CORRECT TRANS-POOL PRUNING CRITERION (overflow fix)
+//     eval_trans_children previously used d_lb (LB-pass distances) for
+//     local_lb_trans.  For coarse rotations, large rotDis makes d_lb≈0 →
+//     local_lb_trans≈0 → ZERO pruning → 8^L exponential blowup → overflow.
+//     Fix: use d_ub (raw DT distance) for local_lb_trans, matching the
+//     original two-pass UB-pass pruning.  d_lb is still used for local_lb_rot
+//     (the rotation LB output), which is correct since the CPU LB-pass inner
+//     BnB also terminates immediately for coarse rotations (finds lb≈0 at the
+//     first node and terminates).
 //     Pool memory: 2 * 256 * 4096 * 20 B = ~42 MB (safe on T4/A100).
 //
 // Synchronization per wavefront level (unchanged from rev 1):
@@ -147,9 +157,14 @@ __global__ void rotate_points_kernel(
 //   local_lb_trans: sum(max(d_lb - maxTransDis, 0)^2)
 //                               → trans-node LB (prune from next level)
 //
-// Using d_lb for trans pruning (LB-pass criterion) is MORE permissive than
-// the UB-pass criterion (d_ub - maxTransDis), so the merged wavefront is a
-// superset of both individual passes.  Both UB and LB results are correct.
+// Trans-pool pruning uses d_ub (UB-pass criterion: local_lb_trans based on
+// max(d_raw, 0)).  This is critical: for coarse rotations (large rotDis),
+// d_lb = max(d_raw - rotDis, 0) ≈ 0, giving local_lb_trans ≈ 0 and zero
+// pruning, causing 8^L BFS blowup.  Using d_ub gives effective pruning even
+// for coarse rotations.  The rotation LB (d_rot_lb_best[k]) is still
+// computed from d_lb and is correct: for coarse rotations the CPU inner-BnB
+// also finds local_lb_rot ≈ 0 immediately and terminates.  For fine
+// rotations d_lb ≈ d_ub so both criteria give the same result.
 //
 // Atomic bit-cast trick: atomicMin on int is valid for non-negative floats
 // because positive IEEE-754 floats have the same ordering as their bit patterns
@@ -232,8 +247,12 @@ __global__ void eval_trans_children(
         if (d_lb < 0.f) d_lb = 0.f;
         local_lb_rot += d_lb * d_lb;
 
-        // Trans LB uses LB-rot distances (more permissive superset criterion)
-        float dlb = d_lb - maxTransDis;
+        // Trans LB uses d_ub (UB-pass criterion) — CRITICAL for convergence.
+        // Using d_lb here would give local_lb_trans≈0 for coarse rotations
+        // (large rotDis → d_lb≈0), eliminating all pruning and causing 8^L
+        // BFS blowup.  Using d_ub instead mirrors the original UB-pass inner
+        // BnB which has effective pruning even for coarse rotations.
+        float dlb = d_ub - maxTransDis;
         if (dlb > 0.f) local_lb_trans += dlb * dlb;
     }
 
