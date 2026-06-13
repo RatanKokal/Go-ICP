@@ -34,6 +34,9 @@ using namespace std;
 #define PI 3.1415926536
 #define SQRT3 1.732050808
 
+// Forward declaration — avoids including goicp_gpu.cuh from this header
+struct GoICPGpu;
+
 typedef struct _POINT3D
 {
 	float x, y, z;
@@ -95,6 +98,12 @@ public:
 	float Register();
 	void BuildDT();
 
+	// Public wrappers for GPU host code (OuterBnB_GPU)
+	void Initialize_public()      { Initialize(); }
+	void Clear_public()           { Clear(); }
+	float CallICP(Matrix& R, Matrix& t) { return ICP(R, t); }
+	float** GetMaxRotDis()        { return maxRotDis; }
+
 	float MSEThresh;
 	float SSEThresh;
 	float icpThresh;
@@ -108,6 +117,9 @@ public:
 	float trimFraction;
 	int inlierNum;
 	bool doTrim;
+
+	// Grant OuterBnB_GPU direct access to private members
+	friend float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx);
 
 private:
 	//temp variables

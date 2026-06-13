@@ -106,6 +106,18 @@ public:
 	double xMin, xMax, yMin, yMax, zMin, zMax;
 	void Build(double* x, double* y, double* z, int num);
 	float Distance(double x, double y, double z);
+
+	// Extract flat distance array for GPU upload.
+	// Caller allocates out[SIZE*SIZE*SIZE] and frees it after use.
+	// Row-major order: out[iz*SIZE*SIZE + iy*SIZE + ix] = A.data[iz][iy][ix].distance
+	void GetDistArray(float* out) const {
+		for (int iz = 0; iz < SIZE; iz++)
+			for (int iy = 0; iy < SIZE; iy++)
+				for (int ix = 0; ix < SIZE; ix++)
+					out[iz*SIZE*SIZE + iy*SIZE + ix] =
+						A.data[iz][iy][ix].distance;
+	}
+
 private:
 	Array3dDEucl3D A;
 };

@@ -1,0 +1,206 @@
+/********************************************************************
+GPU-accelerated main function for Go-ICP
+Replaces jly_main.cpp for the GPU build target.
+
+Key differences from CPU jly_main.cpp:
+  - Calls GoICP::Initialize() and BuildDT() to set up internal state
+  - Extracts DT distance array (float) from DT3D::A.data[z][y][x].distance
+  - Uploads everything to GPU via GpuInit()
+  - Calls OuterBnB_GPU() instead of GoICP::Register()
+  - Calls GoICP::Clear() for cleanup
+
+DT3D field layout (from jly_3ddt.h):
+  DT3D::SIZE          — grid side length
+  DT3D::scale         — double; cast to float for GpuInit
+  DT3D::xMin/yMin/zMin — double; cast to float for GpuInit
+  DT3D::A.data[z][y][x].distance — float distance value
+  Array3d indices: data[iz][iy][ix] in z-major order
+********************************************************************/
+
+#include <time.h>
+#include <iostream>
+#include <fstream>
+using namespace std;
+
+#include "jly_goicp.h"
+#include "goicp_gpu.cuh"
+#include "ConfigMap.hpp"
+
+// Forward declaration — defined in jly_goicp_gpu.cpp
+float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx);
+
+#define DEFAULT_OUTPUT_FNAME "output_gpu.txt"
+#define DEFAULT_CONFIG_FNAME "config.txt"
+#define DEFAULT_MODEL_FNAME  "model.txt"
+#define DEFAULT_DATA_FNAME   "data.txt"
+
+void parseInput(int argc, char **argv,
+                string& modelFName, string& dataFName,
+                int& NdDownsampled,
+                string& configFName, string& outputFName);
+void readConfig(string FName, GoICP& goicp);
+int  loadPointCloud(string FName, int& N, POINT3D** p);
+
+int main(int argc, char** argv)
+{
+    int Nm, Nd, NdDownsampled;
+    clock_t clockBegin, clockEnd;
+    string modelFName, dataFName, configFName, outputFname;
+    POINT3D* pModel;
+    POINT3D* pData;
+    GoICP goicp;
+
+    parseInput(argc, argv, modelFName, dataFName, NdDownsampled, configFName, outputFname);
+    readConfig(configFName, goicp);
+
+    // Load point clouds
+    loadPointCloud(modelFName, Nm, &pModel);
+    loadPointCloud(dataFName,  Nd, &pData);
+
+    goicp.pModel = pModel;
+    goicp.Nm     = Nm;
+    goicp.pData  = pData;
+    goicp.Nd     = Nd;
+
+    // Build Distance Transform (CPU)
+    cout << "Building Distance Transform..." << flush;
+    clockBegin = clock();
+    goicp.BuildDT();
+    clockEnd = clock();
+    cout << (double)(clockEnd - clockBegin)/CLOCKS_PER_SEC << "s" << endl;
+
+    // Downsample if requested
+    if (NdDownsampled > 0)
+        goicp.Nd = NdDownsampled;
+
+    cout << "Model: " << modelFName << " (" << goicp.Nm << "), "
+         << "Data: "  << dataFName  << " (" << goicp.Nd << ")" << endl;
+
+    // Initialise GoICP internal state (allocates maxRotDis, minDis, etc.)
+    // We call the private Initialize() via the public wrapper added to jly_goicp.h.
+    goicp.Initialize_public();
+
+    // ---- Extract DT distance array for upload ----
+    // DT3D::A is Array3dDEucl3D with data[iz][iy][ix].distance (float).
+    // We read from the underlying flat data_array for cache efficiency.
+    int sz = goicp.dt.SIZE;
+    float* flat_dist = new float[(size_t)sz * sz * sz];
+    goicp.dt.GetDistArray(flat_dist);  // fills flat_dist[iz*sz*sz + iy*sz + ix]
+
+    // ---- Upload to GPU ----
+    GoICPGpu gpu_ctx;
+    {
+        // Build flat pData array [Nd*3]
+        float* pData_flat = new float[goicp.Nd * 3];
+        for (int i = 0; i < goicp.Nd; i++) {
+            pData_flat[i*3+0] = goicp.pData[i].x;
+            pData_flat[i*3+1] = goicp.pData[i].y;
+            pData_flat[i*3+2] = goicp.pData[i].z;
+        }
+
+        GpuInit(&gpu_ctx, goicp.Nd, pData_flat,
+                goicp.GetMaxRotDis(),      // public wrapper for private maxRotDis
+                flat_dist, sz,
+                (float)goicp.dt.xMin,
+                (float)goicp.dt.yMin,
+                (float)goicp.dt.zMin,
+                (float)goicp.dt.scale);
+
+        delete[] pData_flat;
+    }
+    delete[] flat_dist;
+
+    // ---- Run GPU-accelerated registration ----
+    cout << "Registering (GPU)..." << endl;
+    clockBegin = clock();
+    OuterBnB_GPU(goicp, gpu_ctx);
+    clockEnd = clock();
+    double elapsed = (double)(clockEnd - clockBegin) / CLOCKS_PER_SEC;
+
+    GpuFree(&gpu_ctx);
+
+    // Clean up GoICP internal allocations
+    goicp.Clear_public();
+
+    // ---- Output ----
+    cout << "Optimal Rotation Matrix:" << endl;
+    cout << goicp.optR << endl;
+    cout << "Optimal Translation Vector:" << endl;
+    cout << goicp.optT << endl;
+    cout << "Finished in " << elapsed << "s" << endl;
+
+    ofstream ofile(outputFname.c_str(), ofstream::out);
+    ofile << elapsed << endl;
+    ofile << goicp.optR << endl;
+    ofile << goicp.optT << endl;
+    ofile.close();
+
+    free(pModel);
+    free(pData);
+
+    return 0;
+}
+
+void parseInput(int argc, char **argv,
+                string& modelFName, string& dataFName,
+                int& NdDownsampled,
+                string& configFName, string& outputFName)
+{
+    modelFName   = DEFAULT_MODEL_FNAME;
+    dataFName    = DEFAULT_DATA_FNAME;
+    configFName  = DEFAULT_CONFIG_FNAME;
+    outputFName  = DEFAULT_OUTPUT_FNAME;
+    NdDownsampled = 0;
+
+    if (argc > 5) outputFName  = argv[5];
+    if (argc > 4) configFName  = argv[4];
+    if (argc > 3) NdDownsampled = atoi(argv[3]);
+    if (argc > 2) dataFName    = argv[2];
+    if (argc > 1) modelFName   = argv[1];
+
+    cout << "INPUT:" << endl;
+    cout << "  model:  " << modelFName   << endl;
+    cout << "  data:   " << dataFName    << endl;
+    cout << "  Nd_ds:  " << NdDownsampled << endl;
+    cout << "  config: " << configFName  << endl;
+    cout << "  output: " << outputFName  << endl << endl;
+}
+
+void readConfig(string FName, GoICP& goicp)
+{
+    ConfigMap config(FName.c_str());
+
+    goicp.MSEThresh             = config.getF("MSEThresh");
+    goicp.initNodeRot.a         = config.getF("rotMinX");
+    goicp.initNodeRot.b         = config.getF("rotMinY");
+    goicp.initNodeRot.c         = config.getF("rotMinZ");
+    goicp.initNodeRot.w         = config.getF("rotWidth");
+    goicp.initNodeTrans.x       = config.getF("transMinX");
+    goicp.initNodeTrans.y       = config.getF("transMinY");
+    goicp.initNodeTrans.z       = config.getF("transMinZ");
+    goicp.initNodeTrans.w       = config.getF("transWidth");
+    goicp.trimFraction          = config.getF("trimFraction");
+    if (goicp.trimFraction < 0.001f)
+        goicp.doTrim = false;
+    goicp.dt.SIZE               = config.getI("distTransSize");
+    goicp.dt.expandFactor       = config.getF("distTransExpandFactor");
+
+    cout << "CONFIG:" << endl;
+    config.print();
+    cout << endl;
+}
+
+int loadPointCloud(string FName, int& N, POINT3D** p)
+{
+    ifstream ifile(FName.c_str(), ifstream::in);
+    if (!ifile.is_open()) {
+        cout << "Unable to open point file '" << FName << "'" << endl;
+        exit(-1);
+    }
+    ifile >> N;
+    *p = (POINT3D*)malloc(sizeof(POINT3D) * N);
+    for (int i = 0; i < N; i++)
+        ifile >> (*p)[i].x >> (*p)[i].y >> (*p)[i].z;
+    ifile.close();
+    return 0;
+}
