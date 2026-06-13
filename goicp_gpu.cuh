@@ -131,6 +131,7 @@ void GpuRunBatch(GoICPGpu* gpu,
                  float optError_snap,
                  int inlierNum,
                  float init_tx, float init_ty, float init_tz, float init_tw,
+                 float mse_thresh,            // per-point MSE tolerance (trans leaf test)
                  GpuRotResult* results_cpu);
 
 void GpuFree(GoICPGpu* gpu);

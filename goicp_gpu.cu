@@ -1,41 +1,50 @@
 // =============================================================================
-// goicp_gpu.cu  —  Method A CUDA implementation (rev 2)
+// goicp_gpu.cu  —  Method A CUDA implementation (rev 3)
 //
-// Rev 2 structural changes (rev 2.1 adds fix 5 — critical overflow fix):
+// Rev 3 changes vs rev 2.1 — the inner translation BnB is now CORRECT under
+// truncation, so a full pool is no longer a fatal condition.  Three coupled
+// changes:
 //
-//  1. MERGED UB+LB PASS
-//     eval_trans_children now computes both local_ub (rotation UB) and
-//     local_lb_rot (rotation LB, with maxRotDis subtracted) in one loop over
-//     the Nd data points.  GpuRunBatch calls run_inner_bnb_wavefront once
-//     instead of twice, halving kernel launches, D2H copies, and sync barriers.
+//  (A) VALID ROTATION LB UNDER TRUNCATION
+//      local_lb_rot now subtracts BOTH rotDis AND the child's maxTransDis:
+//          d_lb = max(d_raw_centre - rotDis - maxTransDis, 0)
+//      Each evaluated child therefore lower-bounds the registration error over
+//      its OWN translation sub-cube (for every rotation in the rotation cube).
+//      min over any covering set of evaluated children is then a valid LB for
+//      the whole (rotation cube x translation cube), independent of how deep
+//      the wavefront went.  Previously local_lb_rot omitted maxTransDis, so the
+//      reported rotation LB was only valid once the BFS had run to convergence
+//      — truncating it produced a too-high (invalid) LB and silently broke
+//      global optimality.
 //
-//  2. 2D GRID — NO CPU TASK COMPACTION
-//     Grid is dim3(actual_k, max_active_count).  The kernel uses blockIdx.x=k,
-//     blockIdx.y=s, and exits immediately when s >= d_active_count_cur[k].
-//     This removes the per-level CPU nested loop that built h_tasks, the H2D
-//     of the task array, and the GpuTask struct entirely.
+//  (B) NON-FATAL TRUNCATION
+//      When the per-node pool is full (slot >= GPU_MAX_TRANS) the child is no
+//      longer pushed, but its bounds were already recorded in (A) BEFORE the
+//      push decision, so the LB stays valid — just looser.  No abort.
+//      d_overflow_flag is repurposed as a truncation COUNTER (telemetry only);
+//      the host prints a one-line non-fatal notice if it fires.
 //
-//  3. OVERFLOW DETECTION
-//     When atomicAdd returns slot >= GPU_MAX_TRANS the node was silently
-//     dropped in rev 1 (correctness risk).  Rev 2 sets d_overflow_flag and
-//     GpuRunBatch aborts with a fatal message so the problem is visible.
+//  (C) WIDTH LEAF TEST
+//      A translation child is a leaf (recorded but not subdivided) once its
+//      uncertainty is below the per-point MSE tolerance:
+//          maxTransDis^2 <= mse_thresh
+//      This stops pointless deep subdivision near convergence (rev 2 ran to a
+//      fixed 60 levels) and is dimensionally consistent: maxTransDis^2 and
+//      MSEThresh are both per-point squared distances.
 //
-//  4. GPU_MAX_TRANS raised to 4096 (was 1024; safety margin after fix 5)
+//  GPU_MAX_TRANS is now a SOFT cap on frontier width, not a crash condition.
+//  Raising it (linear memory cost) tightens the LB and reduces outer-BnB
+//  iterations; it no longer risks a fatal abort.
 //
-//  5. CORRECT TRANS-POOL PRUNING CRITERION (overflow fix)
-//     eval_trans_children previously used d_lb (LB-pass distances) for
-//     local_lb_trans.  For coarse rotations, large rotDis makes d_lb≈0 →
-//     local_lb_trans≈0 → ZERO pruning → 8^L exponential blowup → overflow.
-//     Fix: use d_ub (raw DT distance) for local_lb_trans, matching the
-//     original two-pass UB-pass pruning.  d_lb is still used for local_lb_rot
-//     (the rotation LB output), which is correct since the CPU LB-pass inner
-//     BnB also terminates immediately for coarse rotations (finds lb≈0 at the
-//     first node and terminates).
-//     Pool memory: 2 * 256 * 4096 * 20 B = ~42 MB (safe on T4/A100).
+//  NOTE: this keeps the breadth-first wavefront.  It is correct and bounded,
+//  but at coarse translation widths nothing prunes (maxTransDis >> distances),
+//  so the frontier still saturates the cap and the LB is looser than a
+//  best-first inner search would give.  A best-first-per-node inner BnB is the
+//  real performance fix; this rev makes the wavefront correct and crash-free.
 //
-// Synchronization per wavefront level (unchanged from rev 1):
-//   1× cudaDeviceSynchronize  (mandatory: next level grid size from h_counts)
-//   1× cudaMemcpy D2H of K ints
+// Synchronization per wavefront level (unchanged):
+//   1x cudaDeviceSynchronize  (next level grid size from h_counts)
+//   1x cudaMemcpy D2H of K ints
 // =============================================================================
 
 #include "goicp_gpu.cuh"
@@ -108,7 +117,7 @@ float warp_reduce_sum(float v)
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 1: rotate_points_kernel  (unchanged from rev 1)
+// Kernel 1: rotate_points_kernel  (unchanged)
 // Grid: (K, ceil(Nd/256))   Block: (256)
 // ---------------------------------------------------------------------------
 __global__ void rotate_points_kernel(
@@ -135,7 +144,7 @@ __global__ void rotate_points_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 2: eval_trans_children  (rev 2 — merged UB+LB, 2D grid)
+// Kernel 2: eval_trans_children  (rev 3 — valid LB, leaf test, truncation)
 //
 // Grid:  dim3(actual_k, max_active_count_this_level)
 // Block: dim3(EVAL_BLOCK_N = 256)   — 8 warps, one warp per child
@@ -143,33 +152,32 @@ __global__ void rotate_points_kernel(
 // blockIdx.x = k  (outer rotation node index)
 // blockIdx.y = s  (parent translation slot index)
 //
-// Blocks where s >= d_active_count_cur[k] exit immediately (inactive slot).
-//
 // Each warp (w = threadIdx.x >> 5) evaluates one of the 8 children of the
-// parent at slot s.  The point loop computes:
+// parent at slot s.  The point loop computes, at the child cube CENTRE:
 //
 //   d_raw = dt_lookup(rotated_point + translation_centre)
-//   d_ub  = max(d_raw, 0)
-//   d_lb  = max(d_raw - rotDis[i], 0)
+//   d_ub  = max(d_raw, 0)                              → UB numerator
+//   d_lb  = max(d_raw - rotDis[i] - maxTransDis, 0)    → VALID rot+trans LB
 //
-//   local_ub     += d_ub^2      → rotation UB numerator (min over all children)
-//   local_lb_rot += d_lb^2      → rotation LB numerator (min over all children)
-//   local_lb_trans: sum(max(d_lb - maxTransDis, 0)^2)
-//                               → trans-node LB (prune from next level)
+//   local_ub       += d_ub^2   → rotation UB (min over children = achievable)
+//   local_lb_rot   += d_lb^2   → rotation LB (min over a valid cover)
+//   local_lb_trans += max(d_ub - maxTransDis, 0)^2
+//                              → expansion heuristic only (not a reported bound)
 //
-// Trans-pool pruning uses d_ub (UB-pass criterion: local_lb_trans based on
-// max(d_raw, 0)).  This is critical: for coarse rotations (large rotDis),
-// d_lb = max(d_raw - rotDis, 0) ≈ 0, giving local_lb_trans ≈ 0 and zero
-// pruning, causing 8^L BFS blowup.  Using d_ub gives effective pruning even
-// for coarse rotations.  The rotation LB (d_rot_lb_best[k]) is still
-// computed from d_lb and is correct: for coarse rotations the CPU inner-BnB
-// also finds local_lb_rot ≈ 0 immediately and terminates.  For fine
-// rotations d_lb ≈ d_ub so both criteria give the same result.
+// local_lb_rot subtracts maxTransDis so EVERY evaluated child lower-bounds the
+// error over its own translation sub-cube.  Because the push decision happens
+// AFTER this is recorded, dropping a child (full pool or leaf) keeps the
+// reported LB valid — just looser.
+//
+// Trans-pool expansion uses d_ub (UB-pass criterion).  For coarse rotations
+// (large rotDis) a d_lb-based criterion would clamp to ~0 and prune nothing;
+// d_ub gives effective expansion ordering even there.  Note: this is now only
+// a heuristic for WHICH nodes to spend pool slots on — correctness of the
+// reported LB no longer depends on it.
 //
 // Atomic bit-cast trick: atomicMin on int is valid for non-negative floats
-// because positive IEEE-754 floats have the same ordering as their bit patterns
-// interpreted as unsigned 32-bit integers, and since the sign bit is always 0
-// the signed atomicMin gives the same result.
+// because positive IEEE-754 floats order identically to their bit patterns as
+// unsigned ints, and the sign bit is always 0.
 // ---------------------------------------------------------------------------
 
 #define EVAL_BLOCK_N 256
@@ -189,8 +197,9 @@ __global__ void eval_trans_children(
     float*        d_best_ty,
     float*        d_best_tz,
     float*        d_best_tw,
-    int*          d_overflow_flag,              // [1]
+    int*          d_trunc_count,                // [1]  truncation telemetry
     float         optError_snap,
+    float         mse_thresh,                   // per-point MSE tolerance (leaf)
     int           Nd,
     int           inlierNum,
     int           max_trans_slots)
@@ -198,14 +207,23 @@ __global__ void eval_trans_children(
     int k = blockIdx.x;
     int s = blockIdx.y;
 
-    // Early exit for inactive slots (2D grid may be larger than active count)
-    if (s >= d_active_count_cur[k]) return;
+    // Early exit for inactive slots.  The stored count may exceed
+    // max_trans_slots after a truncated level; clamp so reads stay in bounds.
+    int cnt = d_active_count_cur[k];
+    if (cnt > max_trans_slots) cnt = max_trans_slots;
+    if (s >= cnt) return;
 
     GpuTransNode parent = d_cur[k * max_trans_slots + s];
 
-    float child_w    = parent.w * 0.5f;
-    float half_w     = child_w  * 0.5f;
-    float maxTransDis = GPU_SQRT3 * 0.5f * child_w;
+    float child_w     = parent.w * 0.5f;
+    float half_w      = child_w  * 0.5f;
+    float maxTransDis  = GPU_SQRT3 * 0.5f * child_w;
+    float maxTransDis2 = maxTransDis * maxTransDis;
+
+    // Leaf test: once the child's translation uncertainty is within the
+    // per-point MSE tolerance, further subdivision cannot tighten the bound
+    // by more than the tolerance — record it but do not expand.
+    bool is_leaf = (maxTransDis2 <= mse_thresh);
 
     int w    = threadIdx.x >> 5;   // warp index = child index (0..7)
     int lane = threadIdx.x & 31;
@@ -226,9 +244,9 @@ __global__ void eval_trans_children(
     int my_level = d_rot_levels[k];
     const float* rotDis = d_maxRotDis + my_level * Nd;
 
-    float local_ub      = 0.f;   // rotation UB accumulator
-    float local_lb_rot  = 0.f;   // rotation LB accumulator
-    float local_lb_trans = 0.f;  // translation LB (for pruning)
+    float local_ub       = 0.f;   // rotation UB accumulator
+    float local_lb_rot   = 0.f;   // rotation LB accumulator (VALID: rot+trans)
+    float local_lb_trans = 0.f;   // expansion heuristic only
 
     for (int i = lane; i < inlierNum; i += 32)
     {
@@ -238,22 +256,20 @@ __global__ void eval_trans_children(
 
         float d_raw = dt_lookup(px, py, pz);
 
-        // UB path: clamp at 0 (no rotation uncertainty subtracted)
+        // UB path: clamp at 0
         float d_ub = d_raw < 0.f ? 0.f : d_raw;
         local_ub += d_ub * d_ub;
 
-        // LB-rot path: subtract rotation uncertainty, clamp at 0
-        float d_lb = d_raw - rotDis[i];
+        // VALID LB path: subtract rotation AND translation uncertainty.
+        // This is the change that makes truncation safe — each child now
+        // lower-bounds error over its own translation sub-cube.
+        float d_lb = d_raw - rotDis[i] - maxTransDis;
         if (d_lb < 0.f) d_lb = 0.f;
         local_lb_rot += d_lb * d_lb;
 
-        // Trans LB uses d_ub (UB-pass criterion) — CRITICAL for convergence.
-        // Using d_lb here would give local_lb_trans≈0 for coarse rotations
-        // (large rotDis → d_lb≈0), eliminating all pruning and causing 8^L
-        // BFS blowup.  Using d_ub instead mirrors the original UB-pass inner
-        // BnB which has effective pruning even for coarse rotations.
-        float dlb = d_ub - maxTransDis;
-        if (dlb > 0.f) local_lb_trans += dlb * dlb;
+        // Expansion heuristic (UB-pass criterion). Not a reported bound.
+        float dlt = d_ub - maxTransDis;
+        if (dlt > 0.f) local_lb_trans += dlt * dlt;
     }
 
     // Warp-level horizontal reduction
@@ -269,21 +285,21 @@ __global__ void eval_trans_children(
         int* ub_int = (int*)&d_ub_best[k];
         int old_ub_int = atomicMin(ub_int, new_ub_int);
         if (old_ub_int > new_ub_int) {
-            // This warp found the best UB so far for outer node k
             d_best_tx[k] = cx;
             d_best_ty[k] = cy;
             d_best_tz[k] = cz;
             d_best_tw[k] = child_w;
         }
-        // Cross-node global best UB (drives trans pruning across all k)
         atomicMin((int*)d_ub_global_best, new_ub_int);
 
-        // ---- Rotation LB: update d_rot_lb_best[k] ----
+        // ---- Rotation LB: update d_rot_lb_best[k] (valid for this sub-cube) ----
+        // Recorded BEFORE the push decision below, so a dropped child (leaf or
+        // full pool) still contributes its valid bound.
         atomicMin((int*)&d_rot_lb_best[k], __float_as_int(local_lb_rot));
 
-        // ---- Push child to next level if lb < current global best UB ----
+        // ---- Expand child to next level, unless it is a leaf or pruned ----
         float cur_global_ub = *d_ub_global_best;
-        if (local_lb_trans < cur_global_ub) {
+        if (!is_leaf && local_lb_trans < cur_global_ub) {
             int slot = atomicAdd(&d_active_count_nxt[k], 1);
             if (slot < max_trans_slots) {
                 GpuTransNode child;
@@ -294,15 +310,17 @@ __global__ void eval_trans_children(
                 child.lb_parent = local_lb_trans;
                 d_nxt[k * max_trans_slots + slot] = child;
             } else {
-                // Signal overflow — correctness violated, host will abort
-                atomicExch(d_overflow_flag, 1);
+                // Pool full: do not write. The child's valid LB was already
+                // recorded above, so global optimality is preserved (looser
+                // LB only). Count for telemetry; non-fatal.
+                atomicAdd(d_trunc_count, 1);
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 3: init_batch_state  (rev 2 — initialises rot_lb_best; no is_ub_pass)
+// Kernel 3: init_batch_state  (unchanged)
 // ---------------------------------------------------------------------------
 __global__ void init_batch_state(
     float* d_ub_best,
@@ -354,7 +372,7 @@ __global__ void zero_next_counts(int* d_active_count_nxt, int K)
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 6: collect_results_kernel  (rev 2 — reads d_rot_lb_best for lb field)
+// Kernel 6: collect_results_kernel  (unchanged)
 // ---------------------------------------------------------------------------
 __global__ void collect_results_kernel(
     const float* d_ub_best,
@@ -378,23 +396,21 @@ __global__ void collect_results_kernel(
 // =============================================================================
 
 // ---------------------------------------------------------------------------
-// run_inner_bnb_wavefront  (rev 2)
+// run_inner_bnb_wavefront  (rev 3)
 //
 // Single merged pass: computes rotation UB (d_ub_best) and rotation LB
 // (d_rot_lb_best) in one wavefront over the translation BnB tree.
 //
-// 2D grid replaces task compaction:
-//   gridDim.x = actual_k
-//   gridDim.y = max(h_counts)   — blocks with s >= active_count[k] exit early
-//
-// Sync schedule per level (same as rev 1):
-//   1× cudaDeviceSynchronize  (next grid dim depends on new h_counts)
-//   1× cudaMemcpy D2H of actual_k ints
+// The wavefront now terminates a branch via the width leaf test (in-kernel)
+// rather than a fixed level cap; max_levels remains as a safety bound only.
+// Active counts are clamped to GPU_MAX_TRANS on the host so the next grid Y
+// dimension and all device reads stay in bounds after a truncated level.
 // ---------------------------------------------------------------------------
 static void run_inner_bnb_wavefront(
     GoICPGpu*    gpu,
     int          actual_k,
     float        optError_snap,
+    float        mse_thresh,
     int          inlierNum,
     float        init_tx, float init_ty, float init_tz, float init_tw)
 {
@@ -421,10 +437,11 @@ static void run_inner_bnb_wavefront(
     int h_counts[GPU_BATCH_K];
     for (int k = 0; k < actual_k; k++) h_counts[k] = 1;  // root level
 
-    const int max_levels = 60;
+    const int max_levels = 60;  // safety bound; leaf test normally terminates first
     for (int level = 0; level < max_levels; level++)
     {
-        // Compute max active count to size the Y dimension of the 2D grid
+        // Compute max active count to size the Y dimension of the 2D grid.
+        // h_counts are already clamped to GPU_MAX_TRANS (see end of loop).
         int max_count = 0;
         for (int k = 0; k < actual_k; k++)
             if (h_counts[k] > max_count) max_count = h_counts[k];
@@ -437,8 +454,7 @@ static void run_inner_bnb_wavefront(
             zero_next_counts<<<blk, 256>>>(gpu->d_active_count_nxt, actual_k);
         }
 
-        // 2D grid: (actual_k, max_count)
-        // Inactive slots (s >= d_active_count_cur[k]) exit in 2 instructions.
+        // 2D grid: (actual_k, max_count <= GPU_MAX_TRANS)
         dim3 grid(actual_k, max_count);
         dim3 block(EVAL_BLOCK_N);
 
@@ -454,8 +470,9 @@ static void run_inner_bnb_wavefront(
             gpu->d_rot_lb_best,
             gpu->d_ub_global_best,
             gpu->d_best_tx, gpu->d_best_ty, gpu->d_best_tz, gpu->d_best_tw,
-            gpu->d_overflow_flag,
+            gpu->d_overflow_flag,         // now a truncation counter
             optError_snap,
+            mse_thresh,
             gpu->Nd,
             inlierNum,
             GPU_MAX_TRANS);
@@ -467,6 +484,12 @@ static void run_inner_bnb_wavefront(
         CUDA_CHECK(cudaMemcpy(h_counts, gpu->d_active_count_nxt,
                               sizeof(int) * actual_k,
                               cudaMemcpyDeviceToHost));
+
+        // Clamp to the pool size: a truncated level may report a count larger
+        // than GPU_MAX_TRANS, but only GPU_MAX_TRANS slots hold valid data.
+        // Clamping keeps the next grid Y dim and all device reads in bounds.
+        for (int k = 0; k < actual_k; k++)
+            if (h_counts[k] > GPU_MAX_TRANS) h_counts[k] = GPU_MAX_TRANS;
 
         // Swap cur/nxt pools (pointer swap, no data movement)
         {
@@ -487,6 +510,7 @@ extern "C" void GpuRunBatch(
     float              optError_snap,
     int                inlierNum,
     float              init_tx, float init_ty, float init_tz, float init_tw,
+    float              mse_thresh,
     GpuRotResult*      results_cpu)
 {
     // H2D: rotation matrices and levels (small, synchronous transfers are fine)
@@ -505,7 +529,7 @@ extern "C" void GpuRunBatch(
                               cudaMemcpyHostToDevice));
     }
 
-    // Reset overflow flag before wavefront
+    // Reset truncation counter before wavefront
     CUDA_CHECK(cudaMemset(gpu->d_overflow_flag, 0, sizeof(int)));
 
     // Rotate all Nd points for all K outer nodes
@@ -517,20 +541,24 @@ extern "C" void GpuRunBatch(
     }
 
     // Single merged UB+LB wavefront pass
-    run_inner_bnb_wavefront(gpu, actual_k, optError_snap, inlierNum,
+    run_inner_bnb_wavefront(gpu, actual_k, optError_snap, mse_thresh, inlierNum,
                             init_tx, init_ty, init_tz, init_tw);
 
-    // Check overflow flag once after the full wavefront (one D2H instead of 60)
+    // Truncation telemetry (non-fatal). A high count means the LB is loose and
+    // the outer BnB will need more iterations — raise GPU_MAX_TRANS to tighten.
     {
-        int overflow = 0;
-        CUDA_CHECK(cudaMemcpy(&overflow, gpu->d_overflow_flag,
+        int trunc = 0;
+        CUDA_CHECK(cudaMemcpy(&trunc, gpu->d_overflow_flag,
                               sizeof(int), cudaMemcpyDeviceToHost));
-        if (overflow) {
-            fprintf(stderr,
-                "[GoICP GPU] FATAL: trans-node pool overflow (GPU_MAX_TRANS=%d "
-                "exceeded). Increase GPU_MAX_TRANS in goicp_gpu.cuh and rebuild.\n",
-                GPU_MAX_TRANS);
-            exit(1);
+        if (trunc > 0) {
+            static int warned = 0;
+            if (warned < 8) {  // avoid log spam over the whole run
+                fprintf(stderr,
+                    "[GoICP GPU] note: inner trans-BnB truncated %d node(s) at "
+                    "GPU_MAX_TRANS=%d. LB is valid but looser; raise "
+                    "GPU_MAX_TRANS to tighten.\n", trunc, GPU_MAX_TRANS);
+                warned++;
+            }
         }
     }
 
@@ -635,7 +663,7 @@ extern "C" void GpuInit(
     CUDA_CHECK(cudaMalloc(&gpu->d_rot_result, sizeof(GpuRotResult) * GPU_BATCH_K));
     CUDA_CHECK(cudaMalloc(&gpu->d_rot_levels, sizeof(int)          * GPU_BATCH_K));
 
-    // Wavefront pools (rev 2: GPU_MAX_TRANS = 4096)
+    // Wavefront pools
     size_t pool_sz = sizeof(GpuTransNode) * GPU_BATCH_K * GPU_MAX_TRANS;
     CUDA_CHECK(cudaMalloc(&gpu->d_trans_pool_cur, pool_sz));
     CUDA_CHECK(cudaMalloc(&gpu->d_trans_pool_nxt, pool_sz));
@@ -651,7 +679,7 @@ extern "C" void GpuInit(
     CUDA_CHECK(cudaMalloc(&gpu->d_best_tz,          sizeof(float) * GPU_BATCH_K));
     CUDA_CHECK(cudaMalloc(&gpu->d_best_tw,          sizeof(float) * GPU_BATCH_K));
 
-    // Overflow detection flag
+    // Truncation counter (was overflow flag)
     CUDA_CHECK(cudaMalloc(&gpu->d_overflow_flag, sizeof(int)));
 
     // Pinned host mirrors

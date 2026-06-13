@@ -174,6 +174,7 @@ float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx)
             goicp.initNodeTrans.y,
             goicp.initNodeTrans.z,
             goicp.initNodeTrans.w,
+            goicp.MSEThresh,   // per-point MSE tolerance → inner trans-BnB leaf test
             batch_out);
 
         // ---- Step 1: find best UB in batch ----
