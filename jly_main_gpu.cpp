@@ -80,6 +80,26 @@ int main(int argc, char** argv)
     // We call the private Initialize() via the public wrapper added to jly_goicp.h.
     goicp.Initialize_public();
 
+    // ---- C3 fix: GPU path does not implement partial-sort trimming ----
+    // The GPU eval kernel sums distances over the first inlierNum points by
+    // array index, not the smallest inlierNum values after intro_select().
+    // Force doTrim=false so the GPU UB/LB computation is correct.
+    // trimFraction is honoured by the CPU ICP path (icp3d.do_trim) but the
+    // outer BnB UB/LB will use all Nd points.
+    if (goicp.doTrim) {
+        fprintf(stderr,
+            "[GoICP GPU] WARNING: doTrim=true (trimFraction=%.4f) is not "
+            "supported by the GPU BnB path — forcing doTrim=false.\n"
+            "  inlierNum reset: %d -> %d, SSEThresh reset: %.6g -> %.6g\n"
+            "  ICP sub-calls still use trimFraction via icp3d.do_trim.\n",
+            goicp.trimFraction,
+            goicp.inlierNum, goicp.Nd,
+            (double)goicp.SSEThresh, (double)(goicp.MSEThresh * goicp.Nd));
+        goicp.doTrim    = false;
+        goicp.inlierNum = goicp.Nd;
+        goicp.SSEThresh = goicp.MSEThresh * goicp.Nd;
+    }
+
     // ---- Extract DT distance array for upload ----
     // DT3D::A is Array3dDEucl3D with data[iz][iy][ix].distance (float).
     // We read from the underlying flat data_array for cache efficiency.

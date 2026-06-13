@@ -1,18 +1,20 @@
 #pragma once
 // =============================================================================
-// goicp_gpu.cuh  —  Method A GPU declarations (rev 2)
+// goicp_gpu.cuh  —  Method A GPU declarations (rev 3)
 //
-// Revision 2 changes vs rev 1:
+// Revision 3 changes vs rev 2:
 //   - GpuTask struct removed; 2D grid (k=blockIdx.x, s=blockIdx.y) eliminates
 //     CPU-side task compaction and the H2D task upload on every wavefront level.
 //   - UB and LB inner-BnB wavefront passes merged into one.  eval_trans_children
 //     computes local_ub (rotation UB) and local_lb_rot (rotation LB) in the
-//     same point loop.  GpuRunBatch calls run_inner_bnb_wavefront once instead
-//     of twice.
+//     same point loop.  GpuRunBatch calls run_inner_bnb_wavefront once.
 //   - d_rot_lb_best[K] replaces the formerly-unused d_lb_best[K].
-//   - d_overflow_flag[1] detects when GPU_MAX_TRANS is exceeded (hard error
-//     rather than silent truncation).
+//   - d_overflow_flag repurposed as a truncation counter (telemetry only);
+//     overflow is non-fatal — LB remains valid, just looser.
 //   - GPU_MAX_TRANS raised to 4096 (pool memory ~42 MB, safe on T4/A100).
+//   - P2+P3: persistent cudaStream_t; fused compute_max_and_flag kernel
+//     replaces per-level cudaDeviceSynchronize + K-element D2H.
+//   - P5: d_pData stored in SoA layout for coalesced reads in rotate kernel.
 // =============================================================================
 
 #include <cuda_runtime.h>
@@ -99,8 +101,14 @@ struct GoICPGpu {
     float*         d_best_tz;
     float*         d_best_tw;
 
-    // Overflow detection (set by kernel when GPU_MAX_TRANS exceeded)
+    // Truncation counter (incremented by kernel when GPU_MAX_TRANS exceeded)
     int*           d_overflow_flag;   // [1]
+
+    // P2+P3: persistent stream + fused max/flag buffer
+    // d_wavefront_ctrl[0] = has_active (any count > 0)
+    // d_wavefront_ctrl[1] = max_active (clamped to GPU_MAX_TRANS)
+    cudaStream_t   stream;            // all wavefront kernels run on this stream
+    int*           d_wavefront_ctrl;  // [2] written by compute_max_and_flag kernel
 
     // Pinned host mirrors
     GpuRotBatch*   h_rot_batch;       // pinned [K]
