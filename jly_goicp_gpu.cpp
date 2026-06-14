@@ -69,22 +69,37 @@ static bool angle_axis_to_R(
 // ---------------------------------------------------------------------------
 float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx)
 {
-    // Initial error from identity transform
-    goicp.optError = 0;
-    for (int i = 0; i < goicp.Nd; i++) {
-        float d = goicp.dt.Distance(
-            goicp.pData[i].x, goicp.pData[i].y, goicp.pData[i].z);
-        goicp.optError += d * d;
+    // Bug 5 fix: initial optError using GPU DT (identity pose R=I, t=0).
+    // goicp.dt.Distance() would segfault because BuildDT() was not called.
+    // GpuDtSSE uses the same texture as the BnB kernels — consistent metric.
+    {
+        float R_id[9] = {1,0,0, 0,1,0, 0,0,1};
+        float t_id[3] = {0,0,0};
+        goicp.optError = GpuDtSSE(&gpu_ctx, R_id, t_id);
     }
     printf("Error*: %f (Init)\n", goicp.optError);
 
-    // Initial ICP from identity
+    // Initial ICP from identity pose.
+    // Bug 5 fix: goicp.CallICP() internally calls dt.Distance() for its DT
+    // re-evaluation pass after icp3d.Run().  With GpuBuildDT, the CPU DT is
+    // uninitialized.  Strategy: run icp3d.Run() directly (which is safe — it
+    // only uses the KD-tree, not the DT), then re-evaluate with GpuDtSSE.
     float last_icp_error = goicp.optError;
     {
         clock_t t0 = clock();
         Matrix R_icp = goicp.optR;
         Matrix t_icp = goicp.optT;
-        float error = goicp.ICP(R_icp, t_icp);
+        // Run ICP optimization (KD-tree only, no DT access inside icp3d.Run)
+        goicp.CallICPOptimizeOnly(R_icp, t_icp);
+        float error;
+        // Override with GPU DT SSE for the same final pose.
+        {
+            float R_f[9], t_f[3];
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) R_f[r*3+c] = R_icp.val[r][c];
+            t_f[0]=t_icp.val[0][0]; t_f[1]=t_icp.val[1][0]; t_f[2]=t_icp.val[2][0];
+            error = GpuDtSSE(&gpu_ctx, R_f, t_f);
+        }
         if (error < goicp.optError) {
             goicp.optError = error;
             goicp.optR     = R_icp;
@@ -206,21 +221,33 @@ float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx)
                 printf("Error*: %f\n", goicp.optError);
 
                 // ---- Step 2: ICP — deferred until improvement is significant ----
-                // We skip ICP when the improvement over the last ICP run is tiny
-                // (< ICP_IMPROVEMENT_THRESH).  This prevents the GPU from stalling
-                // on repeated ICP calls during the fine tail of BnB.
+                // Fix 4: use bounded-iteration ICP for intermediate calls.
+                // Full ICP (10000 iter) at Nd=30464 takes ~7.9 s; 10 iterations
+                // takes ~30 ms and still moves the pose close enough to help pruning.
+                // The initial and final ICP calls retain full convergence.
+                static const int INTERMEDIATE_ICP_ITERS = 10;
                 if (goicp.optError < last_icp_error * (1.f - ICP_IMPROVEMENT_THRESH)) {
                     clock_t t0 = clock();
                     Matrix R_icp = goicp.optR;
                     Matrix t_icp = goicp.optT;
-                    float error = goicp.ICP(R_icp, t_icp);
-                    last_icp_error = goicp.optError; // record error at ICP time
+                    // Run bounded ICP pose optimization (KD-tree only inside icp3d.Run)
+                    goicp.CallICP_bounded(R_icp, t_icp, INTERMEDIATE_ICP_ITERS);
+                    // Bug 5 fix: re-evaluate with GPU DT (CPU DT uninitialized)
+                    float error;
+                    {
+                        float R_f[9], t_f[3];
+                        for (int r = 0; r < 3; r++)
+                            for (int c = 0; c < 3; c++) R_f[r*3+c] = R_icp.val[r][c];
+                        t_f[0]=t_icp.val[0][0]; t_f[1]=t_icp.val[1][0]; t_f[2]=t_icp.val[2][0];
+                        error = GpuDtSSE(&gpu_ctx, R_f, t_f);
+                    }
+                    last_icp_error = goicp.optError;
                     if (error < goicp.optError) {
                         goicp.optError = error;
                         goicp.optR     = R_icp;
                         goicp.optT     = t_icp;
                         last_icp_error = error;
-                        printf("Error*: %f (ICP %.2fs)\n", goicp.optError,
+                        printf("Error*: %f (ICP-fast %.2fs)\n", goicp.optError,
                                (double)(clock()-t0)/CLOCKS_PER_SEC);
                     }
                 }
@@ -257,7 +284,17 @@ float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx)
     if (goicp.optError < last_icp_error) {
         Matrix R_icp = goicp.optR;
         Matrix t_icp = goicp.optT;
-        float error = goicp.ICP(R_icp, t_icp);
+        // Run full ICP pose optimization (KD-tree only inside icp3d.Run)
+        goicp.CallICPOptimizeOnly(R_icp, t_icp);
+        // Bug 5 fix: re-evaluate error with GPU DT
+        float error;
+        {
+            float R_f[9], t_f[3];
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) R_f[r*3+c] = R_icp.val[r][c];
+            t_f[0]=t_icp.val[0][0]; t_f[1]=t_icp.val[1][0]; t_f[2]=t_icp.val[2][0];
+            error = GpuDtSSE(&gpu_ctx, R_f, t_f);
+        }
         if (error < goicp.optError) {
             goicp.optError = error;
             goicp.optR     = R_icp;

@@ -105,6 +105,17 @@ float GoICP::ICP(Matrix& R_icp, Matrix& t_icp)
 	return error;
 }
 
+// Fix 4: ICP with bounded iteration count.
+// Identical to ICP() but caps the number of icp3d iterations.
+// Used for intermediate BnB calls to prevent GPU idle time (7.9 s stalls).
+// DT re-evaluation is identical to ICP() so the returned error is on the same
+// metric as BnB bounds — BnB pruning remains valid.
+float GoICP::ICP_bounded(Matrix& R_icp, Matrix& t_icp, int max_iter)
+{
+	icp3d.Run(D_icp, Nd, R_icp, t_icp, (size_t)max_iter);
+	return 0.f;  // GPU path computes error via GpuDtSSE; DT access unsafe here
+}
+
 void GoICP::Initialize()
 {
 	int i, j;

@@ -116,6 +116,13 @@ struct GoICPGpu {
 
     int Nd;
     int K;
+
+    // Fix 3: GPU EDT working buffers
+    float*         d_edt_g;           // [SIZE^3] reused across X/Z passes
+    float*         d_edt_out;         // [SIZE^3] intermediate Y-pass output
+    int            Nm;                // model point count
+    float*         d_pModel_soa;      // [Nm*3] SoA (x|y|z blocks) model points
+    float*         d_partial_sse;     // [ceil(Nd/256)] preallocated block partial sums for GpuDtSSE
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +148,24 @@ void GpuRunBatch(GoICPGpu* gpu,
                  float init_tx, float init_ty, float init_tz, float init_tw,
                  float mse_thresh,            // per-point MSE tolerance (trans leaf test)
                  GpuRotResult* results_cpu);
+
+// Fix 3: GPU Euclidean Distance Transform
+// Replaces CPU goicp.BuildDT() (~2.5 s).  Reads model points (AoS layout),
+// computes exact EDT using 4-pass separable Meijster algorithm, and uploads
+// the result into the existing d_distArray / tex_dist.
+// expandFactor must match goicp.dt.expandFactor (from config).
+void GpuBuildDT(GoICPGpu* gpu,
+                const float* pModel_aos,   // [Nm*3] AoS host buffer
+                int Nm,
+                int dt_size,
+                double expandFactor);
+
+// Bug 5 fix: compute SSE of all Nd data points transformed by R[9], t[3]
+// using the GPU DT texture.  R and t are in row-major float[9]/float[3] on host.
+// Replaces the goicp.dt.Distance() loop in OuterBnB_GPU which segfaults
+// when BuildDT() was not called (GPU EDT path).
+// Returns the sum of squared distances (same metric as BnB bounds).
+float GpuDtSSE(GoICPGpu* gpu, const float R[9], const float t[3]);
 
 void GpuFree(GoICPGpu* gpu);
 

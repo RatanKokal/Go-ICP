@@ -327,16 +327,22 @@ __global__ void init_batch_state(
         *d_ub_global_best = optError_snap;
     if (k >= K) return;
     d_ub_best[k]      = optError_snap;
-    d_rot_lb_best[k]  = optError_snap; // lb can't exceed current best
+    d_rot_lb_best[k]  = FLT_MAX;       // Fix 2: true lb; FLT_MAX = not yet evaluated
     d_best_tx[k]      = init_tx;
     d_best_ty[k]      = init_ty;
     d_best_tz[k]      = init_tz;
     d_best_tw[k]      = init_tw;
-    d_active_count[k] = 1;
+    d_active_count[k] = 8;             // Fix 1: pre-expanded pool (8 children, not 1 root)
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 4: init_trans_pool  (unchanged)
+// Kernel 4: init_trans_pool  (Fix 1: pre-expanded)
+//
+// Seeds the translation pool for all K outer nodes with 8 level-1 children
+// of the root cube instead of the root itself.  This ensures the first
+// wavefront level runs at gridY=8 (warm L2 cache) rather than gridY=1
+// (cold 108 MB DT DRAM access — 186x slower per block).
+// init_batch_state sets d_active_count[k]=8 to match.
 // ---------------------------------------------------------------------------
 __global__ void init_trans_pool(
     GpuTransNode* d_pool,
@@ -345,10 +351,16 @@ __global__ void init_trans_pool(
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= K) return;
-    GpuTransNode root;
-    root.x  = init_tx; root.y = init_ty; root.z = init_tz;
-    root.w  = init_tw; root.lb_parent = 0.f;
-    d_pool[k * max_trans_slots + 0] = root;
+    float child_w = init_tw * 0.5f;
+    for (int j = 0; j < 8; j++) {
+        GpuTransNode child;
+        child.x         = init_tx + (float)(j & 1)       * child_w;
+        child.y         = init_ty + (float)((j >> 1) & 1) * child_w;
+        child.z         = init_tz + (float)((j >> 2) & 1) * child_w;
+        child.w         = child_w;
+        child.lb_parent = 0.f;
+        d_pool[k * max_trans_slots + j] = child;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +482,7 @@ static void run_inner_bnb_wavefront(
     // cudaMemcpyAsync from pageable host memory is unsafe if source goes out
     // of scope before the stream executes the transfer.
     {
-        int seed[2] = {1, 1};   // has_active=1, max_active=1
+        int seed[2] = {1, 8};   // Fix 1: has_active=1, max_active=8 (pre-expanded pool)
         CUDA_CHECK(cudaMemcpy(gpu->d_wavefront_ctrl, seed,
                               2*sizeof(int), cudaMemcpyHostToDevice));
     }
@@ -679,17 +691,20 @@ extern "C" void GpuInit(
     }
 
     // Upload DT distance array to CUDA Array and bind texture object
+    // dt_dist may be nullptr when caller will invoke GpuBuildDT to fill the array.
     cudaExtent extent = make_cudaExtent(dt_size, dt_size, dt_size);
     cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
     CUDA_CHECK(cudaMalloc3DArray(&gpu->d_distArray, &channelDesc, extent));
 
-    cudaMemcpy3DParms copyParams = {0};
-    copyParams.srcPtr   = make_cudaPitchedPtr((void*)dt_dist,
-                                              dt_size*sizeof(float), dt_size, dt_size);
-    copyParams.dstArray = gpu->d_distArray;
-    copyParams.extent   = extent;
-    copyParams.kind     = cudaMemcpyHostToDevice;
-    CUDA_CHECK(cudaMemcpy3D(&copyParams));
+    if (dt_dist != nullptr) {
+        cudaMemcpy3DParms copyParams = {0};
+        copyParams.srcPtr   = make_cudaPitchedPtr((void*)dt_dist,
+                                                  dt_size*sizeof(float), dt_size, dt_size);
+        copyParams.dstArray = gpu->d_distArray;
+        copyParams.extent   = extent;
+        copyParams.kind     = cudaMemcpyHostToDevice;
+        CUDA_CHECK(cudaMemcpy3D(&copyParams));
+    }
 
     cudaResourceDesc resDesc = {};
     resDesc.resType               = cudaResourceTypeArray;
@@ -714,7 +729,24 @@ extern "C" void GpuInit(
     dt_host.scale    = dt_scale;
     dt_host.d_dist   = nullptr;
     gpu->dt = dt_host;
-    CUDA_CHECK(cudaMemcpyToSymbol(c_dt, &dt_host, sizeof(GpuDT)));
+    // Upload c_dt only when bounds are known (dt_dist != nullptr path).
+    // When dt_dist is nullptr, GpuBuildDT will call cudaMemcpyToSymbol itself.
+    if (dt_dist != nullptr) {
+        CUDA_CHECK(cudaMemcpyToSymbol(c_dt, &dt_host, sizeof(GpuDT)));
+    }
+
+    // Fix 3: EDT working buffers — allocated here, filled by GpuBuildDT
+    CUDA_CHECK(cudaMalloc(&gpu->d_edt_g,   sizeof(float) * (size_t)dt_size * dt_size * dt_size));
+    CUDA_CHECK(cudaMalloc(&gpu->d_edt_out, sizeof(float) * (size_t)dt_size * dt_size * dt_size));
+    gpu->d_pModel_soa = nullptr;  // allocated on demand in GpuBuildDT
+    gpu->Nm           = 0;
+
+    // E1: Preallocated partial sum buffer for GpuDtSSE
+    {
+        int sse_blk = 256;
+        int sse_nblocks = (Nd + sse_blk - 1) / sse_blk;
+        CUDA_CHECK(cudaMalloc(&gpu->d_partial_sse, sizeof(float) * sse_nblocks));
+    }
 
     // pDataTemp [K * Nd * 3]
     CUDA_CHECK(cudaMalloc(&gpu->d_pDataTemp,
@@ -761,6 +793,468 @@ extern "C" void GpuInit(
            2.f * pool_sz / 1e6f);
 }
 
+// =============================================================================
+// Bug 5 fix: GpuDtSSE — compute sum-squared DT error on GPU
+//
+// Replaces the goicp.dt.Distance() loop in OuterBnB_GPU which accesses the
+// uninitialized CPU DT struct when GpuBuildDT is used instead of BuildDT().
+// Uses the same dt_lookup() device function as eval_trans_children, so the
+// returned SSE is on the same metric as BnB bounds.
+// =============================================================================
+
+// Kernel: transform each data point by R,t; look up GPU DT; accumulate SSE.
+// Grid: ceil(Nd/256)   Block: 256
+// R[9] and t[3] are passed as compile-time-safe constant via a 12-float buffer
+// in constant memory (reuses the d_R slot for this single-call use).
+__global__ void dt_sse_kernel(
+    const float* __restrict__ d_data_x,   // [Nd] SoA
+    const float* __restrict__ d_data_y,
+    const float* __restrict__ d_data_z,
+    const float* __restrict__ d_Rt,       // [12]: R[0..8] then t[0..2]
+    float* d_partial,                     // [ceil(Nd/256)] partial sums per block
+    int Nd)
+{
+    extern __shared__ float smem[];
+    int i   = blockIdx.x * blockDim.x + threadIdx.x;
+    float v = 0.f;
+    if (i < Nd) {
+        float dx = d_data_x[i], dy = d_data_y[i], dz = d_data_z[i];
+        float px = d_Rt[0]*dx + d_Rt[1]*dy + d_Rt[2]*dz + d_Rt[9];
+        float py = d_Rt[3]*dx + d_Rt[4]*dy + d_Rt[5]*dz + d_Rt[10];
+        float pz = d_Rt[6]*dx + d_Rt[7]*dy + d_Rt[8]*dz + d_Rt[11];
+        float d  = dt_lookup(px, py, pz);
+        v = d * d;
+    }
+    smem[threadIdx.x] = v;
+    __syncthreads();
+    // Block-level reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) d_partial[blockIdx.x] = smem[0];
+}
+
+extern "C" float GpuDtSSE(GoICPGpu* gpu, const float R[9], const float t[3])
+{
+    // Pack R and t into a contiguous 12-float host buffer, upload to d_R.
+    // d_R[GPU_BATCH_K*9] is pre-allocated — we only write the first 12 floats.
+    {
+        float Rt[12];
+        for (int j = 0; j < 9; j++) Rt[j] = R[j];
+        Rt[9] = t[0]; Rt[10] = t[1]; Rt[11] = t[2];
+        CUDA_CHECK(cudaMemcpy(gpu->d_R, Rt, sizeof(float)*12,
+                              cudaMemcpyHostToDevice));
+    }
+
+    int Nd      = gpu->Nd;
+    int blk     = 256;
+    int nblocks = (Nd + blk - 1) / blk;
+
+    if (nblocks > 512) {
+        fprintf(stderr, "Error: nblocks (%d) exceeds stack buffer size (512)\n", nblocks);
+        exit(EXIT_FAILURE);
+    }
+
+    dt_sse_kernel<<<nblocks, blk, blk * sizeof(float), gpu->stream>>>(
+        gpu->d_pData,
+        gpu->d_pData + Nd,
+        gpu->d_pData + 2*Nd,
+        gpu->d_R,
+        gpu->d_partial_sse,
+        Nd);
+
+    float h_partial[512];
+    CUDA_CHECK(cudaMemcpyAsync(h_partial, gpu->d_partial_sse,
+                              sizeof(float)*nblocks, cudaMemcpyDeviceToHost,
+                              gpu->stream));
+    CUDA_CHECK(cudaStreamSynchronize(gpu->stream));
+
+    float sse = 0.f;
+    for (int b = 0; b < nblocks; b++) sse += h_partial[b];
+
+    return sse;
+}
+
+// =============================================================================
+// Fix 3: GPU Euclidean Distance Transform (4-pass separable Meijster)
+//
+// Bounding-box logic mirrors DT3D::Build exactly:
+//   raw min/max → apply expandFactor from center → make cubic (take max extent)
+//   → scale = SIZE / max_extent
+//
+// Kernel launch sizes:
+//   A (init):  grid(ceil(S^3/256))         block(256)  — voxel init
+//   A (seed):  grid(ceil(Nm/256))          block(256)  — model point marking
+//   B (X-pass): grid(ceil(S^2/256))        block(256)  — one col per thread
+//   C (Y-pass): grid(ceil(S^2/256))        block(256)  — one col per thread
+//   D (Z-pass): grid(ceil(S^2/256))        block(256)  — one col per thread
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Kernel A1: initialise EDT grid to FLT_MAX
+// ---------------------------------------------------------------------------
+__global__ void edt_init_kernel(float* d_edt, int total_voxels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_voxels) return;
+    d_edt[i] = FLT_MAX;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel A2: mark model point voxels as seed (distance = 0)
+// One thread per model point; uses ROUND(x) = (int)(x + 0.5f)
+// ---------------------------------------------------------------------------
+__global__ void edt_seed_kernel(
+    float*       d_edt,
+    const float* d_model_x,   // [Nm] SoA
+    const float* d_model_y,
+    const float* d_model_z,
+    int Nm, int SIZE,
+    float xMin, float yMin, float zMin, float scale)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= Nm) return;
+    int ix = (int)(( d_model_x[i] - xMin) * scale + 0.5f);
+    int iy = (int)(( d_model_y[i] - yMin) * scale + 0.5f);
+    int iz = (int)(( d_model_z[i] - zMin) * scale + 0.5f);
+    if (ix < 0 || ix >= SIZE || iy < 0 || iy >= SIZE || iz < 0 || iz >= SIZE)
+        return;
+    d_edt[iz * SIZE * SIZE + iy * SIZE + ix] = 0.f;
+}
+
+// Maximum supported DT grid size for stack arrays in Meijster Y/Z passes.
+// CUDA default per-thread stack is 1-4 KB; at MAX_EDT_SIZE=512:
+//   2 arrays * 512 * 4 bytes = 4096 bytes — at the limit.
+// Raise CUDA stack with cudaDeviceSetLimit(cudaLimitStackSize, N) if needed.
+#define MAX_EDT_SIZE 512
+
+// ---------------------------------------------------------------------------
+// Kernel B: X-pass  (Bug 1 fix)
+// One thread per (iy, iz) column.  Correct 1D forward + backward sweep:
+//   - Forward:  track raw (unsquared) distance from most recent seed on left
+//   - Backward: track raw distance from most recent seed on right, take min
+//   - Square:   write g_x[ix] = (min distance)^2 after both passes
+//
+// The original code squared in the forward pass, which overwrote seed markers
+// (0.0 → 0.0^2 = 0.0 is fine, BUT non-seeds became positive, then the
+// backward pass checked for 0.0 on already-squared values — reading
+// d_g[ix+1]==0 which is only true for seeds themselves, not their neighbours.
+// This caused bwd to be reset to 0 one cell too early, collapsing the
+// backward distance to 0 for all cells left of any seed.)
+// ---------------------------------------------------------------------------
+__global__ void edt_pass_x(float* d_g, int SIZE)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= SIZE * SIZE) return;
+    int iy = col / SIZE;
+    int iz = col % SIZE;
+    float* row = d_g + iz * SIZE * SIZE + iy * SIZE;
+
+    float sentinel = (float)(SIZE * 2 + 1);  // larger than any possible distance
+
+    // Forward pass: accumulate raw (unsquared) distance from nearest seed to the left.
+    // Seeds are marked 0.f by edt_seed_kernel; all others are FLT_MAX from init.
+    float fwd = sentinel;
+    for (int ix = 0; ix < SIZE; ix++) {
+        if (row[ix] == 0.f) fwd = 0.f;             // this cell is a seed
+        else if (fwd < sentinel) fwd += 1.f;        // one step further from left seed
+        row[ix] = fwd;                              // store raw distance, NOT squared
+    }
+
+    // Backward pass: accumulate raw distance from nearest seed to the right.
+    // Take the minimum with the forward distance.
+    float bwd = sentinel;
+    for (int ix = SIZE - 1; ix >= 0; ix--) {
+        if (row[ix] == 0.f) bwd = 0.f;             // this cell is a seed (fwd stored 0)
+        else if (bwd < sentinel) bwd += 1.f;        // one step further from right seed
+        float d = fminf(row[ix], bwd);
+        row[ix] = d * d;                            // square only after taking the min
+    }
+}
+
+// Meijster helper: intersection of parabolas centred at u and v
+__device__ __forceinline__
+float edt_sep(float gu, int u, float gv, int v)
+{
+    // intersection ix of parabola f(x)=gu+(x-u)^2 and gv+(x-v)^2
+    return ((gv - gu) + (float)(v*v - u*u)) / (2.f * (float)(v - u));
+}
+
+// ---------------------------------------------------------------------------
+// Kernel C: Y-pass (Meijster lower-envelope per (ix, iz) column)  (Bug 2 fix)
+// Reads d_gx (X-pass squared result), writes d_out (g_xy^2).
+//
+// Bug 2: when q==0 after popping the entire stack, the original code called
+//   edt_sep(d_gx[s_arr[0]], s_arr[0], g_iy, iy) where s_arr[0] was just
+//   set to iy — producing edt_sep(g_iy, iy, g_iy, iy) = 0/0 = NaN.
+// Fix: only update t_arr[q] when q>0; when q==0, the left boundary is
+// already -infinity (set at initialisation) and must not be recomputed.
+// ---------------------------------------------------------------------------
+__global__ void edt_pass_y(float* d_out, const float* d_gx, int SIZE)
+{
+    static_assert(MAX_EDT_SIZE >= 1, "MAX_EDT_SIZE must be positive");
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= SIZE * SIZE) return;
+    if (SIZE > MAX_EDT_SIZE) return;   // safety guard; raise MAX_EDT_SIZE if needed
+    int ix = col / SIZE;
+    int iz = col % SIZE;
+
+    int   s_arr[MAX_EDT_SIZE];   // Bug 6 fix: compile-time bound avoids stack overflow
+    float t_arr[MAX_EDT_SIZE];
+    int q = 0;
+    s_arr[0] = 0;
+    t_arr[0] = -1e30f;  // leftmost parabola has no left boundary
+
+    // Initialise with distance from voxel 0 (the first parabola)
+    // (iy=0 is already in s_arr[0]; loop starts at iy=1)
+
+    // --- Forward scan: build lower envelope of parabolas ---
+    for (int iy = 1; iy < SIZE; iy++) {
+        float g_iy = d_gx[iz * SIZE * SIZE + iy * SIZE + ix];
+        // Pop parabolas dominated to the left of the new one
+        while (q > 0) {
+            float g_prev = d_gx[iz * SIZE * SIZE + s_arr[q] * SIZE + ix];
+            float isect = edt_sep(g_prev, s_arr[q], g_iy, iy);
+            if (isect > t_arr[q]) break;
+            q--;
+        }
+        // Check if new parabola also dominates index 0
+        if (q == 0) {
+            float g0 = d_gx[iz * SIZE * SIZE + s_arr[0] * SIZE + ix];
+            float isect0 = edt_sep(g0, s_arr[0], g_iy, iy);
+            if (isect0 <= t_arr[0]) {
+                // New parabola dominates from the start; replace
+                s_arr[0] = iy;
+                t_arr[0] = -1e30f;   // Bug 2 fix: do NOT call edt_sep with equal args
+                continue;
+            }
+        }
+        // Push new parabola
+        q++;
+        s_arr[q] = iy;
+        if (q > 0) {   // always true here, but explicit for clarity
+            float g_prev = d_gx[iz * SIZE * SIZE + s_arr[q-1] * SIZE + ix];
+            t_arr[q] = edt_sep(g_prev, s_arr[q-1], g_iy, iy);
+        }
+    }
+
+    // --- Backward scan: assign squared distances ---
+    for (int iy = SIZE - 1; iy >= 0; iy--) {
+        while (q > 0 && t_arr[q] > (float)iy) q--;
+        float dy = (float)(iy - s_arr[q]);
+        float gx2 = d_gx[iz * SIZE * SIZE + s_arr[q] * SIZE + ix];
+        d_out[iz * SIZE * SIZE + iy * SIZE + ix] = gx2 + dy * dy;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel D: Z-pass (Meijster lower-envelope per (ix, iy)) + sqrtf + /scale
+//           (Bug 3 fix: same NaN fix as Bug 2, applied to Z dimension)
+// Reads d_gxy (g_xy^2), writes final world-space Euclidean distances.
+// ---------------------------------------------------------------------------
+__global__ void edt_pass_z(
+    float* d_dist,         // [SIZE^3] output: Euclidean distances in world units
+    const float* d_gxy,    // [SIZE^3] input: g_xy^2 (from Y-pass)
+    int SIZE,
+    float inv_scale)       // 1.0f / scale  (= world_extent / SIZE)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= SIZE * SIZE) return;
+    if (SIZE > MAX_EDT_SIZE) return;
+    int ix = col / SIZE;
+    int iy = col % SIZE;
+
+    int   s_arr[MAX_EDT_SIZE];   // Bug 6 fix
+    float t_arr[MAX_EDT_SIZE];
+    int q = 0;
+    s_arr[0] = 0;
+    t_arr[0] = -1e30f;
+
+    // --- Forward scan ---
+    for (int iz = 1; iz < SIZE; iz++) {
+        float g_iz = d_gxy[iz * SIZE * SIZE + iy * SIZE + ix];
+        while (q > 0) {
+            float g_prev = d_gxy[s_arr[q] * SIZE * SIZE + iy * SIZE + ix];
+            float isect = edt_sep(g_prev, s_arr[q], g_iz, iz);
+            if (isect > t_arr[q]) break;
+            q--;
+        }
+        if (q == 0) {
+            float g0 = d_gxy[s_arr[0] * SIZE * SIZE + iy * SIZE + ix];
+            float isect0 = edt_sep(g0, s_arr[0], g_iz, iz);
+            if (isect0 <= t_arr[0]) {
+                s_arr[0] = iz;
+                t_arr[0] = -1e30f;   // Bug 3 fix: no NaN when stack replaced entirely
+                continue;
+            }
+        }
+        q++;
+        s_arr[q] = iz;
+        {
+            float g_prev = d_gxy[s_arr[q-1] * SIZE * SIZE + iy * SIZE + ix];
+            t_arr[q] = edt_sep(g_prev, s_arr[q-1], g_iz, iz);
+        }
+    }
+
+    // --- Backward scan + convert to world distance ---
+    for (int iz = SIZE - 1; iz >= 0; iz--) {
+        while (q > 0 && t_arr[q] > (float)iz) q--;
+        float dz = (float)(iz - s_arr[q]);
+        float gxy2 = d_gxy[s_arr[q] * SIZE * SIZE + iy * SIZE + ix];
+        float dist_vox = sqrtf(gxy2 + dz * dz);   // distance in voxels
+        d_dist[iz * SIZE * SIZE + iy * SIZE + ix] = dist_vox * inv_scale;
+    }
+}
+
+extern "C" void GpuBuildDT(
+    GoICPGpu*    gpu,
+    const float* pModel_aos,   // [Nm*3] AoS from host
+    int          Nm,
+    int          dt_size,
+    double       expandFactor)
+{
+    // ---- 1. Allocate / upload SoA model buffer ----
+    if (gpu->d_pModel_soa == nullptr || gpu->Nm != Nm) {
+        if (gpu->d_pModel_soa) cudaFree(gpu->d_pModel_soa);
+        CUDA_CHECK(cudaMalloc(&gpu->d_pModel_soa, sizeof(float) * Nm * 3));
+        gpu->Nm = Nm;
+    }
+    {
+        float* soa = (float*)malloc(sizeof(float) * Nm * 3);
+        if (!soa) { fprintf(stderr, "GpuBuildDT: malloc failed\n"); exit(1); }
+        for (int i = 0; i < Nm; i++) {
+            soa[i]        = pModel_aos[i*3+0];   // x-block
+            soa[Nm + i]   = pModel_aos[i*3+1];   // y-block
+            soa[2*Nm + i] = pModel_aos[i*3+2];   // z-block
+        }
+        CUDA_CHECK(cudaMemcpy(gpu->d_pModel_soa, soa,
+                              sizeof(float)*Nm*3, cudaMemcpyHostToDevice));
+        free(soa);
+    }
+
+    // ---- 2. Compute bounding box (mirrors DT3D::Build exactly) ----
+    // Step 1: raw min/max
+    double xMin = pModel_aos[0], xMax = pModel_aos[0];
+    double yMin = pModel_aos[1], yMax = pModel_aos[1];
+    double zMin = pModel_aos[2], zMax = pModel_aos[2];
+    for (int i = 1; i < Nm; i++) {
+        double x = pModel_aos[i*3+0];
+        double y = pModel_aos[i*3+1];
+        double z = pModel_aos[i*3+2];
+        if (x < xMin) xMin = x; if (x > xMax) xMax = x;
+        if (y < yMin) yMin = y; if (y > yMax) yMax = y;
+        if (z < zMin) zMin = z; if (z > zMax) zMax = z;
+    }
+    // Step 2: apply expandFactor from center
+    double xCenter = (xMin + xMax) * 0.5;
+    double yCenter = (yMin + yMax) * 0.5;
+    double zCenter = (zMin + zMax) * 0.5;
+    xMin = xCenter - expandFactor * (xMax - xCenter);
+    xMax = xCenter + expandFactor * (xMax - xCenter);
+    yMin = yCenter - expandFactor * (yMax - yCenter);
+    yMax = yCenter + expandFactor * (yMax - yCenter);
+    zMin = zCenter - expandFactor * (zMax - zCenter);
+    zMax = zCenter + expandFactor * (zMax - zCenter);
+    // Step 3: make cubic (take max extent)
+    double ext = xMax - xMin;
+    if (yMax - yMin > ext) ext = yMax - yMin;
+    if (zMax - zMin > ext) ext = zMax - zMin;
+    xMin = xCenter - ext * 0.5; xMax = xCenter + ext * 0.5;
+    yMin = yCenter - ext * 0.5; yMax = yCenter + ext * 0.5;
+    zMin = zCenter - ext * 0.5; zMax = zCenter + ext * 0.5;
+    // Step 4: scale
+    double scale = (double)dt_size / ext;
+
+    float fxMin  = (float)xMin;
+    float fyMin  = (float)yMin;
+    float fzMin  = (float)zMin;
+    float fscale = (float)scale;
+
+    // ---- 3. Launch EDT kernels ----
+    int S = dt_size;
+    size_t total_vox = (size_t)S * S * S;
+    float* d_g   = gpu->d_edt_g;
+    float* d_out = gpu->d_edt_out;
+
+    // A1: init all voxels to FLT_MAX (d_g used as seed grid initially)
+    {
+        int blk = 256;
+        int grid = (int)((total_vox + blk - 1) / blk);
+        edt_init_kernel<<<grid, blk>>>(d_g, (int)total_vox);
+    }
+    // A2: mark seed voxels (model points)
+    {
+        int blk = 256;
+        int grid = (Nm + blk - 1) / blk;
+        edt_seed_kernel<<<grid, blk>>>(
+            d_g,
+            gpu->d_pModel_soa,
+            gpu->d_pModel_soa + Nm,
+            gpu->d_pModel_soa + 2*Nm,
+            Nm, S, fxMin, fyMin, fzMin, fscale);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // B: X-pass (in-place on d_g): converts seed map to squared X-distances
+    {
+        int cols = S * S;
+        int blk = 256;
+        int grid = (cols + blk - 1) / blk;
+        edt_pass_x<<<grid, blk>>>(d_g, S);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // C: Y-pass: reads d_g (g_x^2), writes d_out (g_xy^2)
+    {
+        int cols = S * S;
+        int blk = 256;
+        int grid = (cols + blk - 1) / blk;
+        edt_pass_y<<<grid, blk>>>(d_out, d_g, S);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // D: Z-pass: reads d_out (g_xy^2), writes d_g (final distances in world units)
+    {
+        int cols = S * S;
+        int blk = 256;
+        int grid = (cols + blk - 1) / blk;
+        float inv_scale = (float)(1.0 / scale);
+        edt_pass_z<<<grid, blk>>>(d_g, d_out, S, inv_scale);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // ---- 4. Upload final distances to CUDA Array (for texture) ----
+    {
+        cudaExtent extent = make_cudaExtent(S, S, S);
+        cudaMemcpy3DParms p = {0};
+        p.srcPtr   = make_cudaPitchedPtr(d_g, S*sizeof(float), S, S);
+        p.dstArray = gpu->d_distArray;
+        p.extent   = extent;
+        p.kind     = cudaMemcpyDeviceToDevice;
+        CUDA_CHECK(cudaMemcpy3D(&p));
+    }
+
+    // ---- 5. Update c_dt constant (xMin/yMin/zMin/scale from GPU EDT bounds) ----
+    {
+        GpuDT dt_host  = gpu->dt;     // copy tex_dist and size
+        dt_host.xMin   = fxMin;
+        dt_host.yMin   = fyMin;
+        dt_host.zMin   = fzMin;
+        dt_host.scale  = fscale;
+        dt_host.size   = S;
+        gpu->dt = dt_host;
+        CUDA_CHECK(cudaMemcpyToSymbol(c_dt, &dt_host, sizeof(GpuDT)));
+    }
+
+    printf("[GPU] GpuBuildDT complete. SIZE=%d, scale=%.4f, "
+           "bounds=[%.3f,%.3f]x[%.3f,%.3f]x[%.3f,%.3f]\n",
+           S, fscale,
+           (double)fxMin, (double)fxMin + ext,
+           (double)fyMin, (double)fyMin + ext,
+           (double)fzMin, (double)fzMin + ext);
+}
+
 extern "C" void GpuFree(GoICPGpu* gpu)
 {
     // Synchronise stream before freeing resources it may still reference
@@ -790,6 +1284,11 @@ extern "C" void GpuFree(GoICPGpu* gpu)
     if (gpu->d_wavefront_ctrl)   cudaFree(gpu->d_wavefront_ctrl);
     if (gpu->h_rot_batch)        cudaFreeHost(gpu->h_rot_batch);
     if (gpu->h_rot_result)       cudaFreeHost(gpu->h_rot_result);
+    // Fix 3: EDT buffers
+    if (gpu->d_edt_g)            cudaFree(gpu->d_edt_g);
+    if (gpu->d_edt_out)          cudaFree(gpu->d_edt_out);
+    if (gpu->d_pModel_soa)       cudaFree(gpu->d_pModel_soa);
+    if (gpu->d_partial_sse)      cudaFree(gpu->d_partial_sse);
     if (gpu->stream)             cudaStreamDestroy(gpu->stream);
     memset(gpu, 0, sizeof(*gpu));
 }

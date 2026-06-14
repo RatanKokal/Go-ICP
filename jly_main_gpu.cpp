@@ -62,12 +62,12 @@ int main(int argc, char** argv)
     goicp.pData  = pData;
     goicp.Nd     = Nd;
 
-    // Build Distance Transform (CPU)
-    cout << "Building Distance Transform..." << flush;
-    clockBegin = clock();
-    goicp.BuildDT();
-    clockEnd = clock();
-    cout << (double)(clockEnd - clockBegin)/CLOCKS_PER_SEC << "s" << endl;
+    // Build Distance Transform
+    // For the GPU build, we skip the CPU BuildDT here and use GpuBuildDT below
+    // (which runs on the GPU in ~30ms vs ~2.5s CPU time).
+    // The DT3D struct fields (SIZE, expandFactor) are still read from config.
+    // For the CPU-mode binary (GoICP via jly_main.cpp), BuildDT is called normally.
+    int sz = goicp.dt.SIZE;
 
     // Downsample if requested
     if (NdDownsampled > 0)
@@ -98,16 +98,12 @@ int main(int argc, char** argv)
         goicp.doTrim    = false;
         goicp.inlierNum = goicp.Nd;
         goicp.SSEThresh = goicp.MSEThresh * goicp.Nd;
+        // Fix 5: Initialize_public() set icp3d.do_trim from the old doTrim value.
+        // Reset it now so intermediate ICP runs on all Nd points (consistent with BnB).
+        goicp.SetIcpTrim(false);
     }
 
-    // ---- Extract DT distance array for upload ----
-    // DT3D::A is Array3dDEucl3D with data[iz][iy][ix].distance (float).
-    // We read from the underlying flat data_array for cache efficiency.
-    int sz = goicp.dt.SIZE;
-    float* flat_dist = new float[(size_t)sz * sz * sz];
-    goicp.dt.GetDistArray(flat_dist);  // fills flat_dist[iz*sz*sz + iy*sz + ix]
-
-    // ---- Upload to GPU ----
+    // ---- Upload to GPU and build DT on GPU ----
     GoICPGpu gpu_ctx;
     {
         // Build flat pData array [Nd*3]
@@ -118,17 +114,31 @@ int main(int argc, char** argv)
             pData_flat[i*3+2] = goicp.pData[i].z;
         }
 
+        // Fix 3: Pass dt_dist=nullptr — GpuBuildDT will fill d_distArray.
+        // dt_xMin/yMin/zMin/scale are all 0 here; GpuBuildDT overwrites c_dt.
         GpuInit(&gpu_ctx, goicp.Nd, pData_flat,
-                goicp.GetMaxRotDis(),      // public wrapper for private maxRotDis
-                flat_dist, sz,
-                (float)goicp.dt.xMin,
-                (float)goicp.dt.yMin,
-                (float)goicp.dt.zMin,
-                (float)goicp.dt.scale);
+                goicp.GetMaxRotDis(),
+                nullptr, sz,
+                0.f, 0.f, 0.f, 0.f);
 
         delete[] pData_flat;
     }
-    delete[] flat_dist;
+
+    // Fix 3: Build DT on GPU (~30ms vs ~2.5s CPU).  Must run after GpuInit.
+    {
+        float* pModel_flat = new float[goicp.Nm * 3];
+        for (int i = 0; i < goicp.Nm; i++) {
+            pModel_flat[i*3+0] = goicp.pModel[i].x;
+            pModel_flat[i*3+1] = goicp.pModel[i].y;
+            pModel_flat[i*3+2] = goicp.pModel[i].z;
+        }
+        cout << "Building Distance Transform (GPU)..." << flush;
+        clockBegin = clock();
+        GpuBuildDT(&gpu_ctx, pModel_flat, goicp.Nm, sz, goicp.dt.expandFactor);
+        clockEnd = clock();
+        cout << (double)(clockEnd - clockBegin)/CLOCKS_PER_SEC << "s" << endl;
+        delete[] pModel_flat;
+    }
 
     // ---- Run GPU-accelerated registration ----
     cout << "Registering (GPU)..." << endl;

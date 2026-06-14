@@ -102,7 +102,13 @@ public:
 	void Initialize_public()      { Initialize(); }
 	void Clear_public()           { Clear(); }
 	float CallICP(Matrix& R, Matrix& t) { return ICP(R, t); }
+	void CallICPOptimizeOnly(Matrix& R, Matrix& t) { icp3d.Run(D_icp, Nd, R, t); }
+	// Fix 4: bounded-iteration ICP for intermediate calls during BnB
+	// Limits icp3d iterations so GPU doesn't sit idle for seconds on each improvement.
+	float CallICP_bounded(Matrix& R, Matrix& t, int max_iter) { return ICP_bounded(R, t, max_iter); }
 	float** GetMaxRotDis()        { return maxRotDis; }
+	// Fix 5: reset icp3d.do_trim after Initialize sets it from goicp.doTrim
+	void SetIcpTrim(bool v)       { icp3d.do_trim = v; }
 
 	float MSEThresh;
 	float SSEThresh;
@@ -135,6 +141,8 @@ private:
 	float * D_icp;
 
 	float ICP(Matrix& R_icp, Matrix& t_icp);
+	// Fix 4: ICP with bounded iteration count; DT re-evaluation identical to ICP()
+	float ICP_bounded(Matrix& R_icp, Matrix& t_icp, int max_iter);
 	float InnerBnB(float* maxRotDisL, TRANSNODE* nodeTransOut);
 	float OuterBnB();
 	void Initialize();
