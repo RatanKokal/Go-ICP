@@ -225,7 +225,7 @@ float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx)
                 // Full ICP (10000 iter) at Nd=30464 takes ~7.9 s; 10 iterations
                 // takes ~30 ms and still moves the pose close enough to help pruning.
                 // The initial and final ICP calls retain full convergence.
-                static const int INTERMEDIATE_ICP_ITERS = 10;
+                static const int INTERMEDIATE_ICP_ITERS = 50;
                 if (goicp.optError < last_icp_error * (1.f - ICP_IMPROVEMENT_THRESH)) {
                     clock_t t0 = clock();
                     Matrix R_icp = goicp.optR;
@@ -279,9 +279,9 @@ float OuterBnB_GPU(GoICP& goicp, GoICPGpu& gpu_ctx)
         }
     }
 
-    // Run a final ICP pass if the last improvement was below the threshold
-    // (ensures we always finish with the best locally-refined result).
-    if (goicp.optError < last_icp_error) {
+    // Run a final full ICP pass unconditionally to ensure we always finish 
+    // with the best fully-converged result (ICP-fast only partially converges).
+    {
         Matrix R_icp = goicp.optR;
         Matrix t_icp = goicp.optT;
         // Run full ICP pose optimization (KD-tree only inside icp3d.Run)
